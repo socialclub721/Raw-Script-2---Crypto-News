@@ -4,6 +4,10 @@ import time
 from datetime import datetime
 from supabase import create_client, Client
 import logging
+from typing import List, Dict, Any, Optional
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
+import hashlib
 
 # Set up logging
 logging.basicConfig(
@@ -12,236 +16,512 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class FinnhubCryptoIngestion:
+class CryptoRSSIngestion:
     def __init__(self):
-        """Initialize the service with environment variables"""
+        """
+        Initialize the Crypto RSS News Ingestion service using environment variables
+        """
         # Get credentials from environment variables
-        self.api_key = os.getenv('FINNHUB_API_KEY')
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_KEY')
         
         # Validate environment variables
-        if not all([self.api_key, supabase_url, supabase_key]):
-            raise ValueError("Missing required environment variables")
+        if not all([supabase_url, supabase_key]):
+            raise ValueError("Missing required environment variables: SUPABASE_URL, SUPABASE_KEY")
         
         # Initialize Supabase client
-        self.supabase = create_client(supabase_url, supabase_key)
+        self.supabase: Client = create_client(supabase_url, supabase_key)
         
-        # Configuration
-        self.base_url = "https://finnhub.io/api/v1/news"
-        self.table_name = "crypto_news"
-        self.min_id = 10  # Starting minId
+        # RSS feed URL for Cointelegraph Editor's Pick
+        self.rss_feed_url = "https://cointelegraph.com/editors_pick_rss"
         
-    def get_last_news_id(self):
-        """Get the highest news ID from database to use as next minId"""
+        # Table name for crypto RSS news data
+        self.crypto_news_table = "crypto_rss_news"
+        
+        # Maximum number of articles to keep in database
+        self.max_articles = 100
+        
+    def fetch_rss_feed(self) -> List[Dict[str, Any]]:
+        """
+        Fetch and parse RSS feed from Cointelegraph
+        
+        Returns:
+            List of parsed crypto news items from RSS feed
+        """
         try:
-            result = self.supabase.table(self.table_name)\
-                .select('id')\
-                .order('id', desc=True)\
+            logger.info(f"Fetching crypto RSS feed from {self.rss_feed_url}...")
+            
+            # Set headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(self.rss_feed_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # Parse XML content
+            root = ET.fromstring(response.content)
+            
+            # Find all items in the RSS feed
+            items = []
+            
+            # Navigate through the XML structure (RSS 2.0 format)
+            channel = root.find('channel')
+            if channel is None:
+                logger.error("No channel found in RSS feed")
+                return []
+            
+            rss_items = channel.findall('item')
+            logger.info(f"Found {len(rss_items)} items in crypto RSS feed")
+            
+            for item in rss_items:
+                try:
+                    title_elem = item.find('title')
+                    link_elem = item.find('link')
+                    author_elem = item.find('author')
+                    pubdate_elem = item.find('pubDate')
+                    description_elem = item.find('description')
+                    
+                    title = title_elem.text if title_elem is not None else ""
+                    link = link_elem.text if link_elem is not None else ""
+                    author = author_elem.text if author_elem is not None else "Cointelegraph"
+                    pubdate = pubdate_elem.text if pubdate_elem is not None else ""
+                    description = description_elem.text if description_elem is not None else ""
+                    
+                    # Create a unique ID based on the link or content
+                    unique_id = hashlib.md5((link + title).encode()).hexdigest()
+                    
+                    # Parse the publication date
+                    parsed_pubdate = None
+                    if pubdate:
+                        try:
+                            # Parse RFC 2822 date format (e.g., "Sat, 16 Aug 2025 14:44:04 GMT")
+                            parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
+                        except ValueError:
+                            try:
+                                # Try alternative format without timezone
+                                parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S")
+                            except ValueError:
+                                try:
+                                    # Try with +0000 timezone format
+                                    parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
+                                except ValueError:
+                                    logger.warning(f"Could not parse date: {pubdate}")
+                    
+                    item_data = {
+                        'unique_id': unique_id,
+                        'title': title.strip(),
+                        'link': link.strip(),
+                        'author': author.strip(),
+                        'description': description.strip(),
+                        'pubdate_raw': pubdate.strip(),
+                        'pubdate_parsed': parsed_pubdate.isoformat() if parsed_pubdate else None,
+                    }
+                    
+                    # Only add items with required fields
+                    if item_data['title'] and item_data['link']:
+                        items.append(item_data)
+                    else:
+                        logger.warning(f"Skipping item with missing title or link: {item_data}")
+                        
+                except Exception as e:
+                    logger.error(f"Error parsing RSS item: {e}")
+                    continue
+            
+            # Sort by publication date (newest first) and take only the latest 100
+            items_with_dates = []
+            items_without_dates = []
+            
+            for item in items:
+                if item.get('pubdate_parsed'):
+                    items_with_dates.append(item)
+                else:
+                    items_without_dates.append(item)
+            
+            # Sort items with dates by publication date (newest first)
+            items_with_dates.sort(key=lambda x: x['pubdate_parsed'], reverse=True)
+            
+            # Combine: items with dates first (sorted), then items without dates
+            sorted_items = items_with_dates + items_without_dates
+            
+            # Take only the latest 100 items
+            latest_items = sorted_items[:100]
+            
+            logger.info(f"Selected latest {len(latest_items)} crypto articles from {len(items)} total items")
+            return latest_items
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching crypto RSS feed: {e}")
+            raise
+        except ET.ParseError as e:
+            logger.error(f"Error parsing crypto RSS XML: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error fetching crypto RSS feed: {e}")
+            raise
+    
+    def check_existing_articles(self, unique_ids: List[str]) -> List[str]:
+        """
+        Check which articles already exist in Supabase
+        
+        Args:
+            unique_ids: List of unique article IDs to check
+            
+        Returns:
+            List of IDs that already exist in the database
+        """
+        if not unique_ids:
+            return []
+        
+        try:
+            result = self.supabase.table(self.crypto_news_table)\
+                .select('unique_id')\
+                .in_('unique_id', unique_ids)\
+                .execute()
+            
+            existing_ids = [item['unique_id'] for item in result.data] if result.data else []
+            logger.info(f"Found {len(existing_ids)} existing crypto articles in database")
+            return existing_ids
+            
+        except Exception as e:
+            logger.error(f"Error checking existing crypto articles: {e}")
+            return []
+    
+    def prepare_articles_for_storage(self, rss_items: List[Dict]) -> List[Dict]:
+        """
+        Prepare RSS articles for storage in Supabase
+        Filters out articles that already exist in the database
+        
+        Args:
+            rss_items: Parsed RSS items
+            
+        Returns:
+            List of formatted articles ready for database insertion
+        """
+        # Extract all unique IDs to check
+        all_ids = [item['unique_id'] for item in rss_items if item.get('unique_id')]
+        
+        # Check which articles already exist
+        existing_ids = self.check_existing_articles(all_ids)
+        existing_ids_set = set(existing_ids)
+        
+        formatted_articles = []
+        current_timestamp = datetime.now().isoformat()
+        duplicates_count = 0
+        
+        for item in rss_items:
+            unique_id = item.get('unique_id', '')
+            
+            # Skip if article already exists
+            if unique_id in existing_ids_set:
+                duplicates_count += 1
+                logger.debug(f"Skipping duplicate crypto article ID: {unique_id}")
+                continue
+            
+            # Format article for database storage
+            formatted_article = {
+                'unique_id': unique_id,
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'author': item.get('author', ''),
+                'description': item.get('description', ''),
+                'pubdate_raw': item.get('pubdate_raw', ''),
+                'pubdate_parsed': item.get('pubdate_parsed'),
+                'ingested_at': current_timestamp,
+                'processed': False
+            }
+            
+            formatted_articles.append(formatted_article)
+        
+        logger.info(f"Prepared {len(formatted_articles)} new crypto articles for storage ({duplicates_count} duplicates skipped)")
+        return formatted_articles
+    
+    def cleanup_old_articles(self, new_articles_count: int) -> bool:
+        """
+        Remove oldest articles to maintain the maximum limit of articles in database
+        
+        Args:
+            new_articles_count: Number of new articles being added
+            
+        Returns:
+            Boolean indicating success
+        """
+        try:
+            if new_articles_count == 0:
+                return True
+            
+            # Get current article count
+            count_result = self.supabase.table(self.crypto_news_table)\
+                .select('*', count='exact')\
+                .execute()
+            
+            current_count = count_result.count if hasattr(count_result, 'count') else len(count_result.data)
+            
+            # Calculate how many articles to delete
+            total_after_insert = current_count + new_articles_count
+            articles_to_delete = max(0, total_after_insert - self.max_articles)
+            
+            if articles_to_delete == 0:
+                logger.info(f"No crypto cleanup needed. Current: {current_count}, adding: {new_articles_count}, max: {self.max_articles}")
+                return True
+            
+            logger.info(f"Need to delete {articles_to_delete} oldest crypto articles to maintain limit of {self.max_articles}")
+            
+            # Get the oldest articles to delete (ordered by pubdate_parsed, then by ingested_at)
+            oldest_articles = self.supabase.table(self.crypto_news_table)\
+                .select('id, title')\
+                .order('pubdate_parsed', desc=False)\
+                .order('ingested_at', desc=False)\
+                .limit(articles_to_delete)\
+                .execute()
+            
+            if not oldest_articles.data:
+                logger.warning("No crypto articles found to delete")
+                return True
+            
+            # Extract IDs to delete
+            ids_to_delete = [article['id'] for article in oldest_articles.data]
+            
+            # Log which articles are being deleted
+            logger.info(f"Deleting {len(ids_to_delete)} oldest crypto articles:")
+            for article in oldest_articles.data[:3]:  # Log first 3
+                logger.info(f"  - {article['title'][:60]}...")
+            if len(oldest_articles.data) > 3:
+                logger.info(f"  ... and {len(oldest_articles.data) - 3} more")
+            
+            # Delete the oldest articles
+            delete_result = self.supabase.table(self.crypto_news_table)\
+                .delete()\
+                .in_('id', ids_to_delete)\
+                .execute()
+            
+            logger.info(f"Successfully deleted {len(ids_to_delete)} oldest crypto articles")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup of old crypto articles: {e}")
+            return False
+    
+    def store_articles_in_supabase(self, formatted_articles: List[Dict]) -> bool:
+        """
+        Store formatted articles in Supabase
+        
+        Args:
+            formatted_articles: List of formatted articles
+            
+        Returns:
+            Boolean indicating success
+        """
+        if not formatted_articles:
+            logger.info("No new crypto articles to store")
+            return True
+        
+        try:
+            # First, cleanup old articles if we're adding new ones
+            cleanup_success = self.cleanup_old_articles(len(formatted_articles))
+            if not cleanup_success:
+                logger.warning("Crypto cleanup failed, but continuing with insertion...")
+            
+            # Insert articles
+            result = self.supabase.table(self.crypto_news_table).insert(
+                formatted_articles
+            ).execute()
+            
+            logger.info(f"Successfully stored {len(formatted_articles)} new crypto articles in Supabase")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error storing crypto articles in Supabase: {e}")
+            raise
+    
+    def get_database_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about the current state of the database
+        
+        Returns:
+            Dictionary with database statistics
+        """
+        try:
+            # Get total count
+            count_result = self.supabase.table(self.crypto_news_table)\
+                .select('*', count='exact')\
+                .execute()
+            
+            total_count = count_result.count if hasattr(count_result, 'count') else len(count_result.data)
+            
+            # Get latest article
+            latest_result = self.supabase.table(self.crypto_news_table)\
+                .select('unique_id, title, pubdate_parsed')\
+                .order('ingested_at', desc=True)\
                 .limit(1)\
                 .execute()
             
-            if result.data and len(result.data) > 0:
-                last_id = result.data[0]['id']
-                logger.info(f"Last ID in database: {last_id}")
-                return last_id
-            else:
-                logger.info(f"No previous records, using default minId: {self.min_id}")
-                return self.min_id
-                
-        except Exception as e:
-            logger.warning(f"Could not get last ID, using default: {e}")
-            return self.min_id
-    
-    def fetch_crypto_news(self):
-        """Fetch crypto news from Finnhub API"""
-        try:
-            # Get the last ID to use as minId
-            min_id = self.get_last_news_id()
-            
-            # API parameters - CRYPTO ONLY
-            params = {
-                'category': 'crypto',  # CRYPTO CATEGORY ONLY
-                'minId': min_id,
-                'token': self.api_key
+            stats = {
+                'total_articles': total_count,
+                'latest_article': latest_result.data[0] if latest_result.data else None
             }
             
-            logger.info(f"Fetching CRYPTO news with minId: {min_id}")
-            response = requests.get(self.base_url, params=params, timeout=30)
-            response.raise_for_status()
-            
-            news_data = response.json()
-            logger.info(f"Fetched {len(news_data)} crypto news articles")
-            
-            # Sort by datetime and take only latest 10
-            news_data.sort(key=lambda x: x.get('datetime', 0), reverse=True)
-            latest_10 = news_data[:10]
-            
-            return latest_10
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching news: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            return []
-    
-    def check_duplicates(self, news_ids):
-        """Check which articles already exist in database"""
-        if not news_ids:
-            return set()
-        
-        try:
-            result = self.supabase.table(self.table_name)\
-                .select('id')\
-                .in_('id', news_ids)\
-                .execute()
-            
-            existing = {item['id'] for item in result.data} if result.data else set()
-            logger.info(f"Found {len(existing)} duplicates")
-            return existing
+            return stats
             
         except Exception as e:
-            logger.error(f"Error checking duplicates: {e}")
-            return set()
+            logger.error(f"Error getting crypto database stats: {e}")
+            return {'total_articles': 0, 'latest_article': None}
     
-    def store_news(self, articles):
-        """Store news articles in Supabase crypto_news table"""
-        if not articles:
-            logger.info("No new articles to store")
-            return True
+    def run_ingestion(self) -> bool:
+        """
+        Run the complete crypto RSS news ingestion process
         
+        Returns:
+            Boolean indicating success
+        """
         try:
-            # Check for duplicates
-            article_ids = [a['id'] for a in articles]
-            existing_ids = self.check_duplicates(article_ids)
+            logger.info("🪙 Starting crypto RSS news ingestion from Cointelegraph...")
+            logger.info(f"📊 Maintaining maximum of {self.max_articles} crypto articles in database")
             
-            # Filter out duplicates
-            new_articles = []
-            for article in articles:
-                if article['id'] not in existing_ids:
-                    # Prepare article with only required fields
-                    formatted = {
-                        'id': article['id'],
-                        'category': article.get('category', 'crypto'),
-                        'datetime': article.get('datetime'),
-                        'headline': article.get('headline', ''),
-                        'source': article.get('source', ''),
-                        'summary': article.get('summary', ''),
-                        'url': article.get('url', ''),
-                        'ingested_at': datetime.now().isoformat()
-                    }
-                    new_articles.append(formatted)
+            # Get database stats before ingestion
+            stats_before = self.get_database_stats()
+            logger.info(f"Database stats before ingestion: {stats_before['total_articles']} total crypto articles")
             
-            if not new_articles:
-                logger.info("All articles already exist - no new articles to add")
+            # Fetch RSS feed
+            rss_items = self.fetch_rss_feed()
+            
+            if not rss_items:
+                logger.info("No crypto articles fetched from RSS feed")
                 return True
             
-            # Insert new articles into crypto_news table
-            result = self.supabase.table(self.table_name).insert(new_articles).execute()
-            logger.info(f"✅ Stored {len(new_articles)} new CRYPTO articles")
+            # Log the fetched articles
+            logger.info("Fetched crypto articles:")
+            for i, article in enumerate(rss_items[:5], 1):
+                logger.info(f"  {i}. {article.get('title', 'No title')[:80]}...")
+            if len(rss_items) > 5:
+                logger.info(f"  ... and {len(rss_items) - 5} more crypto articles")
             
-            # Log first few headlines
-            for i, article in enumerate(new_articles[:3], 1):
-                logger.info(f"  {i}. {article['headline'][:60]}...")
+            # Prepare articles for storage (this will filter out duplicates)
+            formatted_articles = self.prepare_articles_for_storage(rss_items)
             
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing articles: {e}")
-            return False
-    
-    def run(self):
-        """Run the ingestion process"""
-        try:
-            logger.info("🪙 Starting CRYPTO news ingestion...")
-            
-            # Fetch crypto news
-            articles = self.fetch_crypto_news()
-            
-            if not articles:
-                logger.info("No crypto articles fetched")
+            if not formatted_articles:
+                logger.info("✅ All fetched crypto articles already exist in database - no new articles to add")
                 return True
             
-            # Store in database
-            success = self.store_news(articles)
+            # Store in Supabase
+            success = self.store_articles_in_supabase(formatted_articles)
             
             if success:
-                logger.info("✅ Crypto ingestion completed successfully")
+                # Get database stats after ingestion
+                stats_after = self.get_database_stats()
+                logger.info(f"Database stats after ingestion: {stats_after['total_articles']} total crypto articles")
+                logger.info(f"✅ Crypto RSS ingestion completed successfully! Added {len(formatted_articles)} new articles")
             else:
-                logger.error("❌ Crypto ingestion failed")
+                logger.error("❌ Crypto RSS ingestion failed during storage")
             
             return success
             
         except Exception as e:
-            logger.error(f"Fatal error: {e}")
+            logger.error(f"❌ Fatal error during crypto ingestion: {e}")
             return False
 
 
-def main():
-    """Main function - runs continuously every minute"""
-    logger.info("=" * 60)
-    logger.info("🪙 Finnhub CRYPTO News Ingestion Service")
-    logger.info("📊 Fetches latest 10 CRYPTO articles every minute")
-    logger.info("📍 Stores in 'crypto_news' table")
-    logger.info("=" * 60)
-    
-    # Check for run mode
-    run_mode = os.getenv('RUN_MODE', 'continuous').lower()
-    
-    # Initialize service
+def run_once():
+    """
+    Run the ingestion process once
+    """
     try:
-        service = FinnhubCryptoIngestion()
+        # Initialize the ingestion service
+        ingestion_service = CryptoRSSIngestion()
+        
+        # Run the ingestion
+        success = ingestion_service.run_ingestion()
+        
+        if success:
+            logger.info("🎉 Crypto ingestion process completed successfully")
+            return True
+        else:
+            logger.error("💥 Crypto ingestion process failed")
+            return False
+            
     except ValueError as e:
         logger.error(f"Configuration error: {e}")
-        logger.error("Required environment variables:")
-        logger.error("- FINNHUB_API_KEY")
-        logger.error("- SUPABASE_URL")
+        logger.error("Please set the required environment variables in Railway:")
+        logger.error("- SUPABASE_URL") 
         logger.error("- SUPABASE_KEY")
-        exit(1)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return False
+
+
+def main():
+    """
+    Main function to run the crypto RSS news ingestion continuously
+    Runs every minute in an infinite loop
+    """
+    import time
     
-    # Run once mode
+    logger.info("=" * 60)
+    logger.info("🪙 Starting Crypto RSS News Ingestion Service")
+    logger.info("📰 Will fetch Cointelegraph RSS feed every minute")
+    logger.info("=" * 60)
+    
+    # Run mode from environment variable (default to continuous)
+    run_mode = os.getenv('RUN_MODE', 'continuous').lower()
+    
     if run_mode == 'once':
-        logger.info("Running in ONCE mode")
-        success = service.run()
+        # Run once and exit (useful for testing)
+        logger.info("Running in ONCE mode - will execute once and exit")
+        success = run_once()
         exit(0 if success else 1)
     
-    # Continuous mode
-    logger.info("Running in CONTINUOUS mode")
-    failures = 0
-    max_failures = 5
+    # Continuous mode - run every minute
+    logger.info("Running in CONTINUOUS mode - will execute every minute")
+    
+    consecutive_failures = 0
+    max_consecutive_failures = 5
+    interval_seconds = 60  # 1 minute
     
     while True:
         try:
-            start_time = datetime.now()
+            iteration_start = datetime.now()
             logger.info(f"\n{'=' * 50}")
-            logger.info(f"⏰ Run started at {start_time.strftime('%H:%M:%S')}")
+            logger.info(f"⏰ Starting crypto ingestion at {iteration_start.strftime('%Y-%m-%d %H:%M:%S')}")
             
-            # Run ingestion
-            if service.run():
-                failures = 0
+            success = run_once()
+            
+            if success:
+                consecutive_failures = 0
             else:
-                failures += 1
-                if failures >= max_failures:
-                    logger.error(f"Too many failures ({max_failures}). Exiting...")
+                consecutive_failures += 1
+                logger.warning(f"Failed attempt {consecutive_failures}/{max_consecutive_failures}")
+                
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(f"❌ Too many consecutive failures ({max_consecutive_failures}). Exiting...")
                     exit(1)
             
-            # Calculate sleep time
-            elapsed = (datetime.now() - start_time).total_seconds()
-            sleep_time = max(60 - elapsed, 1)
+            # Calculate time until next run
+            iteration_end = datetime.now()
+            processing_time = (iteration_end - iteration_start).total_seconds()
+            logger.info(f"⏱️  Processing took {processing_time:.2f} seconds")
             
-            logger.info(f"⏱️  Took {elapsed:.1f}s. Sleeping {sleep_time:.1f}s...")
+            # Wait for the specified interval
+            sleep_time = max(interval_seconds - processing_time, 1)  # Minimum 1 second sleep
+            logger.info(f"💤 Sleeping for {sleep_time:.2f} seconds until next run...")
+            logger.info(f"{'=' * 50}\n")
+            
             time.sleep(sleep_time)
             
         except KeyboardInterrupt:
-            logger.info("\n⛔ Shutting down...")
+            logger.info("\n⛔ Received interrupt signal. Shutting down gracefully...")
             break
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            failures += 1
-            if failures >= max_failures:
+            logger.error(f"❌ Unexpected error in main loop: {e}")
+            consecutive_failures += 1
+            
+            if consecutive_failures >= max_consecutive_failures:
+                logger.error(f"❌ Too many consecutive failures ({max_consecutive_failures}). Exiting...")
                 exit(1)
-            time.sleep(60)
+            
+            # Wait a bit before retrying
+            logger.info(f"⏳ Waiting {interval_seconds} seconds before retry...")
+            time.sleep(interval_seconds)
 
 
 if __name__ == "__main__":
