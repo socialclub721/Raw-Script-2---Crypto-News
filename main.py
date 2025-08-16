@@ -235,12 +235,14 @@ class CryptoRSSIngestion:
                 logger.debug(f"Skipping duplicate crypto article ID: {unique_id}")
                 continue
             
-            # Format article for database storage (match rss_news_data schema)
+            # Format article for database storage
             formatted_article = {
                 'unique_id': unique_id,
                 'title': item.get('title', ''),
                 'link': item.get('link', ''),
                 'author': item.get('author', ''),
+                'description': item.get('description', ''),  # Added back description
+                'guid': item.get('guid', ''),              # Added back guid
                 'pubdate_raw': item.get('pubdate_raw', ''),
                 'pubdate_parsed': item.get('pubdate_parsed'),
                 'ingested_at': current_timestamp,
