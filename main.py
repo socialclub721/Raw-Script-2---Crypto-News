@@ -35,8 +35,8 @@ class CryptoRSSIngestion:
         # RSS feed URL for Cointelegraph Editor's Pick
         self.rss_feed_url = "https://cointelegraph.com/editors_pick_rss"
         
-        # Table name for crypto RSS news data
-        self.crypto_news_table = "crypto_rss_news"
+        # Table name for crypto RSS news data (using same table as general news for now)
+        self.crypto_news_table = "rss_news_data"  # Changed from "crypto_rss_news"
         
         # Maximum number of articles to keep in database
         self.max_articles = 100
@@ -226,14 +226,12 @@ class CryptoRSSIngestion:
                 logger.debug(f"Skipping duplicate crypto article ID: {unique_id}")
                 continue
             
-            # Format article for database storage
+            # Format article for database storage (match rss_news_data schema)
             formatted_article = {
                 'unique_id': unique_id,
                 'title': item.get('title', ''),
                 'link': item.get('link', ''),
                 'author': item.get('author', ''),
-                'description': item.get('description', ''),
-                'guid': item.get('guid', ''),
                 'pubdate_raw': item.get('pubdate_raw', ''),
                 'pubdate_parsed': item.get('pubdate_parsed'),
                 'ingested_at': current_timestamp,
