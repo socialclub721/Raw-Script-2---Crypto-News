@@ -25,18 +25,27 @@ class CryptoRSSIngestion:
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_KEY')
         
+        # Debug logging for environment variables
+        logger.info(f"🔍 Supabase URL: {supabase_url[:50]}..." if supabase_url else "❌ SUPABASE_URL not found")
+        logger.info(f"🔍 Supabase Key length: {len(supabase_key) if supabase_key else 0} characters")
+        
         # Validate environment variables
         if not all([supabase_url, supabase_key]):
             raise ValueError("Missing required environment variables: SUPABASE_URL, SUPABASE_KEY")
         
-        # Initialize Supabase client
-        self.supabase: Client = create_client(supabase_url, supabase_key)
+        # Initialize Supabase client with debug info
+        try:
+            self.supabase: Client = create_client(supabase_url, supabase_key)
+            logger.info("✅ Supabase client initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Supabase client: {e}")
+            raise
         
         # RSS feed URL for Cointelegraph Editor's Pick
         self.rss_feed_url = "https://cointelegraph.com/editors_pick_rss"
         
         # Table name for crypto RSS news data (using same table as general news for now)
-        self.crypto_news_table = "rss_news_data"  # Changed from "crypto_rss_news"
+        self.crypto_news_table = "crypto_rss_news"  # Changed from "crypto_rss_news"
         
         # Maximum number of articles to keep in database
         self.max_articles = 100
@@ -349,6 +358,8 @@ class CryptoRSSIngestion:
             Dictionary with database statistics
         """
         try:
+            logger.info(f"🔍 Testing connection to table: {self.crypto_news_table}")
+            
             # Get total count
             count_result = self.supabase.table(self.crypto_news_table)\
                 .select('*', count='exact')\
@@ -368,10 +379,20 @@ class CryptoRSSIngestion:
                 'latest_article': latest_result.data[0] if latest_result.data else None
             }
             
+            logger.info(f"✅ Database connection successful. Found {total_count} articles")
             return stats
             
         except Exception as e:
-            logger.error(f"Error getting crypto database stats: {e}")
+            logger.error(f"❌ Database connection failed: {e}")
+            logger.error(f"❌ Error type: {type(e)}")
+            # Try a simple test query
+            try:
+                logger.info("🔄 Attempting simple test query...")
+                test_result = self.supabase.table(self.crypto_news_table).select('*').limit(1).execute()
+                logger.info(f"✅ Simple query worked: {len(test_result.data)} rows")
+            except Exception as test_e:
+                logger.error(f"❌ Simple test query also failed: {test_e}")
+            
             return {'total_articles': 0, 'latest_article': None}
     
     def run_ingestion(self) -> bool:
