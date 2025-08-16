@@ -78,33 +78,40 @@ class CryptoRSSIngestion:
                 try:
                     title_elem = item.find('title')
                     link_elem = item.find('link')
-                    author_elem = item.find('author')
+                    # Look for dc:creator element (Dublin Core namespace)
+                    author_elem = item.find('{http://purl.org/dc/elements/1.1/}creator')
+                    # Fallback to regular author if dc:creator not found
+                    if author_elem is None:
+                        author_elem = item.find('author')
                     pubdate_elem = item.find('pubDate')
                     description_elem = item.find('description')
+                    guid_elem = item.find('guid')
                     
                     title = title_elem.text if title_elem is not None else ""
                     link = link_elem.text if link_elem is not None else ""
                     author = author_elem.text if author_elem is not None else "Cointelegraph"
                     pubdate = pubdate_elem.text if pubdate_elem is not None else ""
                     description = description_elem.text if description_elem is not None else ""
+                    guid = guid_elem.text if guid_elem is not None else ""
                     
-                    # Create a unique ID based on the link or content
-                    unique_id = hashlib.md5((link + title).encode()).hexdigest()
+                    # Create a unique ID based on the GUID or link + title
+                    unique_source = guid if guid else (link + title)
+                    unique_id = hashlib.md5(unique_source.encode()).hexdigest()
                     
                     # Parse the publication date
                     parsed_pubdate = None
                     if pubdate:
                         try:
-                            # Parse RFC 2822 date format (e.g., "Sat, 16 Aug 2025 14:44:04 GMT")
-                            parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
+                            # Parse RFC 2822 date format with timezone (e.g., "Sat, 16 Aug 2025 08:49:44 +0100")
+                            parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
                         except ValueError:
                             try:
-                                # Try alternative format without timezone
+                                # Try without timezone
                                 parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S")
                             except ValueError:
                                 try:
-                                    # Try with +0000 timezone format
-                                    parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
+                                    # Try with GMT timezone
+                                    parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
                                 except ValueError:
                                     logger.warning(f"Could not parse date: {pubdate}")
                     
@@ -114,6 +121,7 @@ class CryptoRSSIngestion:
                         'link': link.strip(),
                         'author': author.strip(),
                         'description': description.strip(),
+                        'guid': guid.strip(),
                         'pubdate_raw': pubdate.strip(),
                         'pubdate_parsed': parsed_pubdate.isoformat() if parsed_pubdate else None,
                     }
@@ -225,6 +233,7 @@ class CryptoRSSIngestion:
                 'link': item.get('link', ''),
                 'author': item.get('author', ''),
                 'description': item.get('description', ''),
+                'guid': item.get('guid', ''),
                 'pubdate_raw': item.get('pubdate_raw', ''),
                 'pubdate_parsed': item.get('pubdate_parsed'),
                 'ingested_at': current_timestamp,
