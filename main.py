@@ -44,8 +44,8 @@ class CryptoRSSIngestion:
         # RSS feed URL for Cointelegraph Editor's Pick
         self.rss_feed_url = "https://cointelegraph.com/editors_pick_rss"
         
-        # Table name for crypto RSS news data (using same table as general news for now)
-        self.crypto_news_table = "crypto_rss_news"  # Changed from "crypto_rss_news"
+        # Table name for crypto RSS news data
+        self.crypto_news_table = "crypto_rss_news"
         
         # Maximum number of articles to keep in database
         self.max_articles = 100
