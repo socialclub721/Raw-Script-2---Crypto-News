@@ -41,8 +41,19 @@ class CryptoRSSIngestion:
             logger.error(f"❌ Failed to initialize Supabase client: {e}")
             raise
         
-        # RSS feed URL for Cointelegraph Editor's Pick
-        self.rss_feed_url = "https://cointelegraph.com/editors_pick_rss"
+        # RSS feed URLs - now supporting multiple feeds
+        self.rss_feeds = [
+            {
+                'name': 'Cointelegraph',
+                'url': 'https://cointelegraph.com/editors_pick_rss',
+                'source': 'Cointelegraph'
+            },
+            {
+                'name': 'CoinDesk',
+                'url': 'https://www.coindesk.com/arc/outboundfeeds/rss',
+                'source': 'CoinDesk'
+            }
+        ]
         
         # Table name for crypto RSS news data
         self.crypto_news_table = "crypto_rss_news"
@@ -50,22 +61,29 @@ class CryptoRSSIngestion:
         # Maximum number of articles to keep in database
         self.max_articles = 100
         
-    def fetch_rss_feed(self) -> List[Dict[str, Any]]:
+    def fetch_single_rss_feed(self, feed_config: Dict[str, str]) -> List[Dict[str, Any]]:
         """
-        Fetch and parse RSS feed from Cointelegraph
+        Fetch and parse a single RSS feed
         
+        Args:
+            feed_config: Dictionary containing feed name, URL, and source
+            
         Returns:
             List of parsed crypto news items from RSS feed
         """
+        feed_name = feed_config['name']
+        feed_url = feed_config['url']
+        default_source = feed_config['source']
+        
         try:
-            logger.info(f"Fetching crypto RSS feed from {self.rss_feed_url}...")
+            logger.info(f"Fetching {feed_name} RSS feed from {feed_url}...")
             
             # Set headers to mimic a browser request
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
-            response = requests.get(self.rss_feed_url, headers=headers, timeout=30)
+            response = requests.get(feed_url, headers=headers, timeout=30)
             response.raise_for_status()
             
             # Parse XML content
@@ -77,17 +95,17 @@ class CryptoRSSIngestion:
             # Navigate through the XML structure (RSS 2.0 format)
             channel = root.find('channel')
             if channel is None:
-                logger.error("No channel found in RSS feed")
+                logger.error(f"No channel found in {feed_name} RSS feed")
                 return []
             
             rss_items = channel.findall('item')
-            logger.info(f"Found {len(rss_items)} items in crypto RSS feed")
+            logger.info(f"Found {len(rss_items)} items in {feed_name} RSS feed")
             
             for item in rss_items:
                 try:
                     title_elem = item.find('title')
                     link_elem = item.find('link')
-                    # Look for dc:creator element (Dublin Core namespace)
+                    # Look for dc:creator element (Dublin Core namespace) - used by both feeds
                     author_elem = item.find('{http://purl.org/dc/elements/1.1/}creator')
                     # Fallback to regular author if dc:creator not found
                     if author_elem is None:
@@ -98,14 +116,36 @@ class CryptoRSSIngestion:
                     
                     title = title_elem.text if title_elem is not None else ""
                     link = link_elem.text if link_elem is not None else ""
-                    author = author_elem.text if author_elem is not None else "Cointelegraph"
+                    
+                    # Handle author field - CoinDesk may have multiple dc:creator elements
+                    author = ""
+                    if author_elem is not None:
+                        author = author_elem.text
+                    else:
+                        # For CoinDesk, try to get all dc:creator elements
+                        authors = item.findall('{http://purl.org/dc/elements/1.1/}creator')
+                        if authors:
+                            author_names = [auth.text for auth in authors if auth.text]
+                            author = ", ".join(author_names)
+                    
+                    # Fallback to default source if no author found
+                    if not author:
+                        author = default_source
+                    
                     pubdate = pubdate_elem.text if pubdate_elem is not None else ""
                     description = description_elem.text if description_elem is not None else ""
                     guid = guid_elem.text if guid_elem is not None else ""
                     
-                    # Create a unique ID based on the GUID or link + title
+                    # Clean up CDATA sections in title and description
+                    if title and title.strip().startswith('<![CDATA[') and title.strip().endswith(']]>'):
+                        title = title.strip()[9:-3].strip()
+                    
+                    if description and description.strip().startswith('<![CDATA[') and description.strip().endswith(']]>'):
+                        description = description.strip()[9:-3].strip()
+                    
+                    # Create a unique ID based on the GUID or link + title, prefixed with source
                     unique_source = guid if guid else (link + title)
-                    unique_id = hashlib.md5(unique_source.encode()).hexdigest()
+                    unique_id = f"{default_source.lower()}_{hashlib.md5(unique_source.encode()).hexdigest()}"
                     
                     # Parse the publication date
                     parsed_pubdate = None
@@ -122,7 +162,11 @@ class CryptoRSSIngestion:
                                     # Try with GMT timezone
                                     parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
                                 except ValueError:
-                                    logger.warning(f"Could not parse date: {pubdate}")
+                                    try:
+                                        # Try with +0000 format (CoinDesk uses this)
+                                        parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S +0000")
+                                    except ValueError:
+                                        logger.warning(f"Could not parse date: {pubdate}")
                     
                     item_data = {
                         'unique_id': unique_id,
@@ -133,49 +177,76 @@ class CryptoRSSIngestion:
                         'guid': guid.strip(),
                         'pubdate_raw': pubdate.strip(),
                         'pubdate_parsed': parsed_pubdate.isoformat() if parsed_pubdate else None,
+                        'source_feed': feed_name  # Track which feed this came from
                     }
                     
                     # Only add items with required fields
                     if item_data['title'] and item_data['link']:
                         items.append(item_data)
                     else:
-                        logger.warning(f"Skipping item with missing title or link: {item_data}")
+                        logger.warning(f"Skipping {feed_name} item with missing title or link: {item_data}")
                         
                 except Exception as e:
-                    logger.error(f"Error parsing RSS item: {e}")
+                    logger.error(f"Error parsing {feed_name} RSS item: {e}")
                     continue
             
-            # Sort by publication date (newest first) and take only the latest 100
-            items_with_dates = []
-            items_without_dates = []
-            
-            for item in items:
-                if item.get('pubdate_parsed'):
-                    items_with_dates.append(item)
-                else:
-                    items_without_dates.append(item)
-            
-            # Sort items with dates by publication date (newest first)
-            items_with_dates.sort(key=lambda x: x['pubdate_parsed'], reverse=True)
-            
-            # Combine: items with dates first (sorted), then items without dates
-            sorted_items = items_with_dates + items_without_dates
-            
-            # Take only the latest 100 items
-            latest_items = sorted_items[:100]
-            
-            logger.info(f"Selected latest {len(latest_items)} crypto articles from {len(items)} total items")
-            return latest_items
+            logger.info(f"Successfully parsed {len(items)} items from {feed_name}")
+            return items
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching crypto RSS feed: {e}")
-            raise
+            logger.error(f"Error fetching {feed_name} RSS feed: {e}")
+            return []
         except ET.ParseError as e:
-            logger.error(f"Error parsing crypto RSS XML: {e}")
-            raise
+            logger.error(f"Error parsing {feed_name} RSS XML: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Unexpected error fetching crypto RSS feed: {e}")
-            raise
+            logger.error(f"Unexpected error fetching {feed_name} RSS feed: {e}")
+            return []
+    
+    def fetch_rss_feed(self) -> List[Dict[str, Any]]:
+        """
+        Fetch and parse RSS feeds from all configured sources
+        
+        Returns:
+            List of parsed crypto news items from all RSS feeds
+        """
+        all_items = []
+        
+        for feed_config in self.rss_feeds:
+            feed_items = self.fetch_single_rss_feed(feed_config)
+            all_items.extend(feed_items)
+        
+        # Sort by publication date (newest first) and take only the latest 100
+        items_with_dates = []
+        items_without_dates = []
+        
+        for item in all_items:
+            if item.get('pubdate_parsed'):
+                items_with_dates.append(item)
+            else:
+                items_without_dates.append(item)
+        
+        # Sort items with dates by publication date (newest first)
+        items_with_dates.sort(key=lambda x: x['pubdate_parsed'], reverse=True)
+        
+        # Combine: items with dates first (sorted), then items without dates
+        sorted_items = items_with_dates + items_without_dates
+        
+        # Take only the latest 100 items
+        latest_items = sorted_items[:100]
+        
+        logger.info(f"Selected latest {len(latest_items)} crypto articles from {len(all_items)} total items across all feeds")
+        
+        # Log breakdown by source
+        source_counts = {}
+        for item in latest_items:
+            source = item.get('source_feed', 'Unknown')
+            source_counts[source] = source_counts.get(source, 0) + 1
+        
+        for source, count in source_counts.items():
+            logger.info(f"  - {source}: {count} articles")
+        
+        return latest_items
     
     def check_existing_articles(self, unique_ids: List[str]) -> List[str]:
         """
@@ -241,8 +312,8 @@ class CryptoRSSIngestion:
                 'title': item.get('title', ''),
                 'link': item.get('link', ''),
                 'author': item.get('author', ''),
-                'description': item.get('description', ''),  # Added back description
-                'guid': item.get('guid', ''),              # Added back guid
+                'description': item.get('description', ''),
+                'guid': item.get('guid', ''),
                 'pubdate_raw': item.get('pubdate_raw', ''),
                 'pubdate_parsed': item.get('pubdate_parsed'),
                 'ingested_at': current_timestamp,
@@ -405,8 +476,9 @@ class CryptoRSSIngestion:
             Boolean indicating success
         """
         try:
-            logger.info("🪙 Starting crypto RSS news ingestion from Cointelegraph...")
+            logger.info("🪙 Starting crypto RSS news ingestion from multiple sources...")
             logger.info(f"📊 Maintaining maximum of {self.max_articles} crypto articles in database")
+            logger.info(f"📡 RSS Sources: {', '.join([feed['name'] for feed in self.rss_feeds])}")
             
             # Get database stats before ingestion
             stats_before = self.get_database_stats()
@@ -416,13 +488,14 @@ class CryptoRSSIngestion:
             rss_items = self.fetch_rss_feed()
             
             if not rss_items:
-                logger.info("No crypto articles fetched from RSS feed")
+                logger.info("No crypto articles fetched from RSS feeds")
                 return True
             
             # Log the fetched articles
             logger.info("Fetched crypto articles:")
             for i, article in enumerate(rss_items[:5], 1):
-                logger.info(f"  {i}. {article.get('title', 'No title')[:80]}...")
+                source = article.get('source_feed', 'Unknown')
+                logger.info(f"  {i}. [{source}] {article.get('title', 'No title')[:60]}...")
             if len(rss_items) > 5:
                 logger.info(f"  ... and {len(rss_items) - 5} more crypto articles")
             
@@ -488,8 +561,8 @@ def main():
     import time
     
     logger.info("=" * 60)
-    logger.info("🪙 Starting Crypto RSS News Ingestion Service")
-    logger.info("📰 Will fetch Cointelegraph RSS feed every minute")
+    logger.info("🪙 Starting Multi-Source Crypto RSS News Ingestion Service")
+    logger.info("📰 Will fetch Cointelegraph + CoinDesk RSS feeds every minute")
     logger.info("=" * 60)
     
     # Run mode from environment variable (default to continuous)
