@@ -1,13 +1,12 @@
 import os
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from supabase import create_client, Client
 import logging
 from typing import List, Dict, Any, Optional
 import xml.etree.ElementTree as ET
-from urllib.parse import urljoin
-import hashlib
+import re
 
 # Set up logging
 logging.basicConfig(
@@ -16,318 +15,528 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CryptoRSSIngestion:
+class CryptoRSSNewsIngestion:
     def __init__(self):
         """
         Initialize the Crypto RSS News Ingestion service using environment variables
         """
-        # Get credentials from environment variables
+        # Get credentials from environment variables (Railway will set these)
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_KEY')
-        
-        # Debug logging for environment variables
-        logger.info(f"🔍 Supabase URL: {supabase_url[:50]}..." if supabase_url else "❌ SUPABASE_URL not found")
-        logger.info(f"🔍 Supabase Key length: {len(supabase_key) if supabase_key else 0} characters")
         
         # Validate environment variables
         if not all([supabase_url, supabase_key]):
             raise ValueError("Missing required environment variables: SUPABASE_URL, SUPABASE_KEY")
         
-        # Initialize Supabase client with debug info
-        try:
-            self.supabase: Client = create_client(supabase_url, supabase_key)
-            logger.info("✅ Supabase client initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Supabase client: {e}")
-            raise
+        # Initialize Supabase client
+        self.supabase: Client = create_client(supabase_url, supabase_key)
         
-        # RSS feed URLs - now supporting multiple feeds
-        self.rss_feeds = [
-            {
-                'name': 'Cointelegraph',
-                'url': 'https://cointelegraph.com/editors_pick_rss',
-                'source': 'Cointelegraph'
-            },
-            {
-                'name': 'CoinDesk',
-                'url': 'https://www.coindesk.com/arc/outboundfeeds/rss',
-                'source': 'CoinDesk'
-            }
-        ]
+        # RSS feed URLs
+        self.rss_feeds = {
+            'coindesk': 'https://www.coindesk.com/arc/outboundfeeds/rss',
+            'cointelegraph': 'https://cointelegraph.com/rss',
+            'theblock': 'https://www.theblock.co/rss.xml'
+        }
         
-        # Table name for crypto RSS news data
-        self.crypto_news_table = "crypto_rss_news"
+        # Table name for crypto news articles
+        self.news_table = "crypto_news_articles"
+        
+        # Maximum number of articles to fetch per feed per run
+        self.max_articles_per_feed = 10
         
         # Maximum number of articles to keep in database
-        self.max_articles = 100
+        self.max_articles_in_db = 100
         
-    def fetch_single_rss_feed(self, feed_config: Dict[str, str]) -> List[Dict[str, Any]]:
+    def parse_rfc2822_date(self, date_str: str) -> Optional[datetime]:
         """
-        Fetch and parse a single RSS feed
+        Parse RFC 2822 date format used in RSS feeds with proper timezone handling
         
         Args:
-            feed_config: Dictionary containing feed name, URL, and source
+            date_str: Date string from RSS feed
             
         Returns:
-            List of parsed crypto news items from RSS feed
+            Parsed datetime object in UTC or None if parsing fails
         """
-        feed_name = feed_config['name']
-        feed_url = feed_config['url']
-        default_source = feed_config['source']
+        if not date_str:
+            return None
+        
+        # Clean up the date string
+        date_str = date_str.strip()
+        
+        # Import required modules for timezone handling
+        from email.utils import parsedate_to_datetime
+        import email.utils
         
         try:
-            logger.info(f"Fetching {feed_name} RSS feed from {feed_url}...")
+            # Use email.utils.parsedate_to_datetime which properly handles RFC 2822 dates
+            # This handles GMT, EST, PST, +0000, -0500, etc. properly
+            dt = parsedate_to_datetime(date_str)
             
-            # Set headers to mimic a browser request
+            # Convert to UTC if it has timezone info
+            if dt.tzinfo is not None:
+                dt = dt.utctimetuple()
+                dt = datetime(*dt[:6])
+            
+            return dt
+            
+        except (ValueError, TypeError, OverflowError):
+            pass
+        
+        # Fallback: Manual parsing for common RSS date formats
+        formats = [
+            "%a, %d %b %Y %H:%M:%S %z",      # Wed, 27 Aug 2025 13:30:00 +0100
+            "%a, %d %b %Y %H:%M:%S %Z",      # Wed, 27 Aug 2025 09:18:56 GMT
+            "%a, %d %b %Y %H:%M:%S",         # Without timezone
+            "%d %b %Y %H:%M:%S %Z",          # Without day name
+            "%Y-%m-%d %H:%M:%S %Z",          # ISO-like format
+            "%Y-%m-%dT%H:%M:%S%z",           # ISO format with timezone
+            "%Y-%m-%dT%H:%M:%SZ"             # ISO format UTC
+        ]
+        
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+                
+        logger.warning(f"Could not parse date: {date_str}")
+        return None
+    
+    def extract_description_from_html(self, html_content: str) -> str:
+        """
+        Extract clean description from HTML content
+        
+        Args:
+            html_content: HTML content from RSS description
+            
+        Returns:
+            Clean text description
+        """
+        if not html_content:
+            return ""
+        
+        # Remove HTML tags using regex
+        clean_text = re.sub(r'<[^>]+>', ' ', html_content)
+        
+        # Remove extra whitespace and decode HTML entities
+        import html
+        clean_text = html.unescape(clean_text)
+        clean_text = ' '.join(clean_text.split())
+        
+        return clean_text.strip()
+    
+    def clean_cdata(self, text: str) -> str:
+        """
+        Remove CDATA wrapper from text content
+        
+        Args:
+            text: Text that may contain CDATA wrapper
+            
+        Returns:
+            Clean text without CDATA wrapper
+        """
+        if not text:
+            return ""
+        
+        text = text.strip()
+        if text.startswith('<![CDATA[') and text.endswith(']]>'):
+            text = text[9:-3]  # Remove CDATA wrapper
+        
+        return text.strip()
+    
+    def fetch_coindesk_rss(self) -> List[Dict[str, Any]]:
+        """
+        Fetch CoinDesk articles from their RSS feed
+        
+        Returns:
+            List of parsed news items
+        """
+        try:
+            url = self.rss_feeds['coindesk']
+            logger.info(f"Fetching CoinDesk articles...")
+            
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            response = requests.get(feed_url, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
             
-            # Parse XML content
             root = ET.fromstring(response.content)
-            
-            # Find all items in the RSS feed
             items = []
             
-            # Navigate through the XML structure (RSS 2.0 format)
+            # Parse RSS feed
             channel = root.find('channel')
             if channel is None:
-                logger.error(f"No channel found in {feed_name} RSS feed")
-                return []
-            
+                return items
+                
             rss_items = channel.findall('item')
-            logger.info(f"Found {len(rss_items)} items in {feed_name} RSS feed")
+            logger.info(f"Found {len(rss_items)} CoinDesk articles in feed")
             
+            # Sort by publication date and take only the latest 10
+            items_with_dates = []
             for item in rss_items:
                 try:
-                    title_elem = item.find('title')
-                    link_elem = item.find('link')
-                    # Look for dc:creator element (Dublin Core namespace) - used by both feeds
-                    author_elem = item.find('{http://purl.org/dc/elements/1.1/}creator')
-                    # Fallback to regular author if dc:creator not found
-                    if author_elem is None:
-                        author_elem = item.find('author')
-                    pubdate_elem = item.find('pubDate')
-                    description_elem = item.find('description')
-                    guid_elem = item.find('guid')
+                    pub_date = item.find('pubDate')
+                    pub_date_text = pub_date.text if pub_date is not None else ""
+                    parsed_date = self.parse_rfc2822_date(pub_date_text)
                     
-                    title = title_elem.text if title_elem is not None else ""
-                    link = link_elem.text if link_elem is not None else ""
-                    
-                    # Handle author field - CoinDesk may have multiple dc:creator elements
-                    author = ""
-                    if author_elem is not None:
-                        author = author_elem.text
-                    else:
-                        # For CoinDesk, try to get all dc:creator elements
-                        authors = item.findall('{http://purl.org/dc/elements/1.1/}creator')
-                        if authors:
-                            author_names = [auth.text for auth in authors if auth.text]
-                            author = ", ".join(author_names)
-                    
-                    # Fallback to default source if no author found
-                    if not author:
-                        author = default_source
-                    
-                    pubdate = pubdate_elem.text if pubdate_elem is not None else ""
-                    description = description_elem.text if description_elem is not None else ""
-                    guid = guid_elem.text if guid_elem is not None else ""
-                    
-                    # Clean up CDATA sections in title and description
-                    if title and title.strip().startswith('<![CDATA[') and title.strip().endswith(']]>'):
-                        title = title.strip()[9:-3].strip()
-                    
-                    if description and description.strip().startswith('<![CDATA[') and description.strip().endswith(']]>'):
-                        description = description.strip()[9:-3].strip()
-                    
-                    # Create a unique ID based on the GUID or link + title, prefixed with source
-                    unique_source = guid if guid else (link + title)
-                    unique_id = f"{default_source.lower()}_{hashlib.md5(unique_source.encode()).hexdigest()}"
-                    
-                    # Parse the publication date
-                    parsed_pubdate = None
-                    if pubdate:
-                        try:
-                            # Parse RFC 2822 date format with timezone (e.g., "Sat, 16 Aug 2025 08:49:44 +0100")
-                            parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %z")
-                        except ValueError:
-                            try:
-                                # Try without timezone
-                                parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S")
-                            except ValueError:
-                                try:
-                                    # Try with GMT timezone
-                                    parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S %Z")
-                                except ValueError:
-                                    try:
-                                        # Try with +0000 format (CoinDesk uses this)
-                                        parsed_pubdate = datetime.strptime(pubdate, "%a, %d %b %Y %H:%M:%S +0000")
-                                    except ValueError:
-                                        logger.warning(f"Could not parse date: {pubdate}")
-                    
-                    item_data = {
-                        'unique_id': unique_id,
-                        'title': title.strip(),
-                        'link': link.strip(),
-                        'author': author.strip(),
-                        'description': description.strip(),
-                        'guid': guid.strip(),
-                        'pubdate_raw': pubdate.strip(),
-                        'pubdate_parsed': parsed_pubdate.isoformat() if parsed_pubdate else None,
-                        'source_feed': feed_name  # Track which feed this came from
-                    }
-                    
-                    # Only add items with required fields
-                    if item_data['title'] and item_data['link']:
-                        items.append(item_data)
-                    else:
-                        logger.warning(f"Skipping {feed_name} item with missing title or link: {item_data}")
-                        
-                except Exception as e:
-                    logger.error(f"Error parsing {feed_name} RSS item: {e}")
+                    if parsed_date:
+                        items_with_dates.append((item, parsed_date))
+                except:
                     continue
             
-            logger.info(f"Successfully parsed {len(items)} items from {feed_name}")
+            # Sort by date (newest first) and take only the latest 10
+            items_with_dates.sort(key=lambda x: x[1], reverse=True)
+            latest_items = items_with_dates[:self.max_articles_per_feed]
+            
+            logger.info(f"Processing latest {len(latest_items)} CoinDesk articles")
+            
+            for item, parsed_date in latest_items:
+                try:
+                    title = item.find('title')
+                    link = item.find('link')
+                    description = item.find('description')
+                    
+                    title_text = self.clean_cdata(title.text if title is not None else "")
+                    link_text = link.text if link is not None else ""
+                    description_text = self.clean_cdata(description.text if description is not None else "")
+                    
+                    # Skip if missing essential fields
+                    if not title_text or not link_text:
+                        continue
+                    
+                    # Extract clean description from HTML
+                    clean_description = self.extract_description_from_html(description_text)
+                    
+                    item_data = {
+                        'headline': title_text.strip(),
+                        'description': clean_description if clean_description else None,
+                        'link': link_text.strip(),
+                        'published_at': parsed_date.isoformat(),
+                        'source_name': 'CoinDesk'
+                    }
+                    
+                    items.append(item_data)
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing CoinDesk item: {e}")
+                    continue
+            
             return items
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching {feed_name} RSS feed: {e}")
-            return []
-        except ET.ParseError as e:
-            logger.error(f"Error parsing {feed_name} RSS XML: {e}")
-            return []
         except Exception as e:
-            logger.error(f"Unexpected error fetching {feed_name} RSS feed: {e}")
+            logger.error(f"Error fetching CoinDesk feed: {e}")
             return []
     
-    def fetch_rss_feed(self) -> List[Dict[str, Any]]:
+    def fetch_cointelegraph_rss(self) -> List[Dict[str, Any]]:
         """
-        Fetch and parse RSS feeds from all configured sources
+        Fetch Cointelegraph articles from their RSS feed
         
         Returns:
-            List of parsed crypto news items from all RSS feeds
+            List of parsed news items
         """
-        all_items = []
-        
-        for feed_config in self.rss_feeds:
-            feed_items = self.fetch_single_rss_feed(feed_config)
-            all_items.extend(feed_items)
-        
-        # Sort by publication date (newest first) and take only the latest 100
-        items_with_dates = []
-        items_without_dates = []
-        
-        for item in all_items:
-            if item.get('pubdate_parsed'):
-                items_with_dates.append(item)
-            else:
-                items_without_dates.append(item)
-        
-        # Sort items with dates by publication date (newest first)
-        items_with_dates.sort(key=lambda x: x['pubdate_parsed'], reverse=True)
-        
-        # Combine: items with dates first (sorted), then items without dates
-        sorted_items = items_with_dates + items_without_dates
-        
-        # Take only the latest 100 items
-        latest_items = sorted_items[:100]
-        
-        logger.info(f"Selected latest {len(latest_items)} crypto articles from {len(all_items)} total items across all feeds")
-        
-        # Log breakdown by source
-        source_counts = {}
-        for item in latest_items:
-            source = item.get('source_feed', 'Unknown')
-            source_counts[source] = source_counts.get(source, 0) + 1
-        
-        for source, count in source_counts.items():
-            logger.info(f"  - {source}: {count} articles")
-        
-        return latest_items
+        try:
+            url = self.rss_feeds['cointelegraph']
+            logger.info(f"Fetching Cointelegraph articles...")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            root = ET.fromstring(response.content)
+            items = []
+            
+            # Parse RSS feed
+            channel = root.find('channel')
+            if channel is None:
+                return items
+                
+            rss_items = channel.findall('item')
+            logger.info(f"Found {len(rss_items)} Cointelegraph articles in feed")
+            
+            # Sort by publication date and take only the latest 10
+            items_with_dates = []
+            for item in rss_items:
+                try:
+                    pub_date = item.find('pubDate')
+                    pub_date_text = pub_date.text if pub_date is not None else ""
+                    parsed_date = self.parse_rfc2822_date(pub_date_text)
+                    
+                    if parsed_date:
+                        items_with_dates.append((item, parsed_date))
+                except:
+                    continue
+            
+            # Sort by date (newest first) and take only the latest 10
+            items_with_dates.sort(key=lambda x: x[1], reverse=True)
+            latest_items = items_with_dates[:self.max_articles_per_feed]
+            
+            logger.info(f"Processing latest {len(latest_items)} Cointelegraph articles")
+            
+            for item, parsed_date in latest_items:
+                try:
+                    title = item.find('title')
+                    link = item.find('link')
+                    description = item.find('description')
+                    
+                    title_text = self.clean_cdata(title.text if title is not None else "")
+                    link_text = link.text if link is not None else ""
+                    description_text = self.clean_cdata(description.text if description is not None else "")
+                    
+                    # Skip if missing essential fields
+                    if not title_text or not link_text:
+                        continue
+                    
+                    # Extract clean description from HTML
+                    clean_description = self.extract_description_from_html(description_text)
+                    
+                    item_data = {
+                        'headline': title_text.strip(),
+                        'description': clean_description if clean_description else None,
+                        'link': link_text.strip(),
+                        'published_at': parsed_date.isoformat(),
+                        'source_name': 'Cointelegraph'
+                    }
+                    
+                    items.append(item_data)
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing Cointelegraph item: {e}")
+                    continue
+            
+            return items
+            
+        except Exception as e:
+            logger.error(f"Error fetching Cointelegraph feed: {e}")
+            return []
     
-    def check_existing_articles(self, unique_ids: List[str]) -> List[str]:
+    def fetch_theblock_rss(self) -> List[Dict[str, Any]]:
         """
-        Check which articles already exist in Supabase
+        Fetch The Block articles from their RSS feed
+        
+        Returns:
+            List of parsed news items
+        """
+        try:
+            url = self.rss_feeds['theblock']
+            logger.info(f"Fetching The Block articles...")
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            root = ET.fromstring(response.content)
+            items = []
+            
+            # Parse RSS feed
+            channel = root.find('channel')
+            if channel is None:
+                return items
+                
+            rss_items = channel.findall('item')
+            logger.info(f"Found {len(rss_items)} The Block articles in feed")
+            
+            # Sort by publication date and take only the latest 10
+            items_with_dates = []
+            for item in rss_items:
+                try:
+                    pub_date = item.find('pubDate')
+                    pub_date_text = pub_date.text if pub_date is not None else ""
+                    parsed_date = self.parse_rfc2822_date(pub_date_text)
+                    
+                    if parsed_date:
+                        items_with_dates.append((item, parsed_date))
+                except:
+                    continue
+            
+            # Sort by date (newest first) and take only the latest 10
+            items_with_dates.sort(key=lambda x: x[1], reverse=True)
+            latest_items = items_with_dates[:self.max_articles_per_feed]
+            
+            logger.info(f"Processing latest {len(latest_items)} The Block articles")
+            
+            for item, parsed_date in latest_items:
+                try:
+                    title = item.find('title')
+                    link = item.find('link')
+                    description = item.find('description')
+                    
+                    title_text = self.clean_cdata(title.text if title is not None else "")
+                    link_text = link.text if link is not None else ""
+                    description_text = self.clean_cdata(description.text if description is not None else "")
+                    
+                    # Skip if missing essential fields
+                    if not title_text or not link_text:
+                        continue
+                    
+                    # Extract clean description from HTML
+                    clean_description = self.extract_description_from_html(description_text)
+                    
+                    item_data = {
+                        'headline': title_text.strip(),
+                        'description': clean_description if clean_description else None,
+                        'link': link_text.strip(),
+                        'published_at': parsed_date.isoformat(),
+                        'source_name': 'The Block'
+                    }
+                    
+                    items.append(item_data)
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing The Block item: {e}")
+                    continue
+            
+            return items
+            
+        except Exception as e:
+            logger.error(f"Error fetching The Block feed: {e}")
+            return []
+    
+    def fetch_all_feeds(self) -> List[Dict[str, Any]]:
+        """
+        Fetch articles from all RSS feeds
+        
+        Returns:
+            Combined list of all articles from all feeds
+        """
+        all_articles = []
+        
+        # Fetch CoinDesk articles
+        coindesk_articles = self.fetch_coindesk_rss()
+        all_articles.extend(coindesk_articles)
+        
+        # Fetch Cointelegraph articles
+        cointelegraph_articles = self.fetch_cointelegraph_rss()
+        all_articles.extend(cointelegraph_articles)
+        
+        # Fetch The Block articles
+        theblock_articles = self.fetch_theblock_rss()
+        all_articles.extend(theblock_articles)
+        
+        # Sort all articles by publication date (oldest first for proper chronological order)
+        # Convert ISO strings to datetime objects for proper sorting
+        def get_sort_key(article):
+            try:
+                # Parse the ISO datetime string back to a datetime object for sorting
+                dt_str = article['published_at']
+                if dt_str.endswith('Z'):
+                    dt_str = dt_str[:-1] + '+00:00'
+                return datetime.fromisoformat(dt_str)
+            except:
+                # Fallback to current time if parsing fails
+                return datetime.now()
+        
+        all_articles.sort(key=get_sort_key)
+        
+        logger.info(f"Total articles fetched: {len(all_articles)} (CoinDesk: {len(coindesk_articles)}, Cointelegraph: {len(cointelegraph_articles)}, The Block: {len(theblock_articles)})")
+        
+        # Debug: Log the sorting to verify it's working
+        logger.info("Article chronological order check (first 5):")
+        for i, article in enumerate(all_articles[:5], 1):
+            dt_obj = get_sort_key(article)
+            pub_time = dt_obj.strftime('%Y-%m-%d %H:%M:%S')  # Clean format for logging
+            source = article['source_name']
+            title = article['headline'][:40]
+            logger.info(f"  {i}. {pub_time} [{source}] {title}...")
+        
+        if len(all_articles) > 5:
+            logger.info("  ...")
+            # Also log the last few to verify proper sorting
+            logger.info("Last 3 articles (newest):")
+            for i, article in enumerate(all_articles[-3:], len(all_articles)-2):
+                dt_obj = get_sort_key(article)  
+                pub_time = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+                source = article['source_name']
+                title = article['headline'][:40]
+                logger.info(f"  {i}. {pub_time} [{source}] {title}...")
+        
+        return all_articles
+    
+    def check_existing_articles(self, links: List[str]) -> List[str]:
+        """
+        Check which articles already exist in Supabase based on their links
         
         Args:
-            unique_ids: List of unique article IDs to check
+            links: List of article links to check
             
         Returns:
-            List of IDs that already exist in the database
+            List of links that already exist in the database
         """
-        if not unique_ids:
+        if not links:
             return []
         
         try:
-            result = self.supabase.table(self.crypto_news_table)\
-                .select('unique_id')\
-                .in_('unique_id', unique_ids)\
+            # Check all links in one query
+            result = self.supabase.table(self.news_table)\
+                .select('link')\
+                .in_('link', links)\
                 .execute()
             
-            existing_ids = [item['unique_id'] for item in result.data] if result.data else []
-            logger.info(f"Found {len(existing_ids)} existing crypto articles in database")
-            return existing_ids
+            existing_links = [item['link'] for item in result.data] if result.data else []
+            logger.info(f"Found {len(existing_links)} existing articles out of {len(links)} checked")
+            return existing_links
             
         except Exception as e:
-            logger.error(f"Error checking existing crypto articles: {e}")
+            logger.error(f"Error checking existing articles: {e}")
             return []
     
-    def prepare_articles_for_storage(self, rss_items: List[Dict]) -> List[Dict]:
+    def prepare_articles_for_storage(self, articles: List[Dict]) -> List[Dict]:
         """
-        Prepare RSS articles for storage in Supabase
+        Prepare articles for storage in Supabase
         Filters out articles that already exist in the database
         
         Args:
-            rss_items: Parsed RSS items
+            articles: List of parsed articles
             
         Returns:
             List of formatted articles ready for database insertion
         """
-        # Extract all unique IDs to check
-        all_ids = [item['unique_id'] for item in rss_items if item.get('unique_id')]
+        if not articles:
+            return []
+        
+        # Extract all links to check for duplicates
+        all_links = [article['link'] for article in articles]
         
         # Check which articles already exist
-        existing_ids = self.check_existing_articles(all_ids)
-        existing_ids_set = set(existing_ids)
+        existing_links = self.check_existing_articles(all_links)
+        existing_links_set = set(existing_links)
         
-        formatted_articles = []
-        current_timestamp = datetime.now().isoformat()
+        new_articles = []
         duplicates_count = 0
         
-        for item in rss_items:
-            unique_id = item.get('unique_id', '')
-            
+        for article in articles:
             # Skip if article already exists
-            if unique_id in existing_ids_set:
+            if article['link'] in existing_links_set:
                 duplicates_count += 1
-                logger.debug(f"Skipping duplicate crypto article ID: {unique_id}")
                 continue
-            
-            # Format article for database storage
-            formatted_article = {
-                'unique_id': unique_id,
-                'title': item.get('title', ''),
-                'link': item.get('link', ''),
-                'author': item.get('author', ''),
-                'description': item.get('description', ''),
-                'guid': item.get('guid', ''),
-                'pubdate_raw': item.get('pubdate_raw', ''),
-                'pubdate_parsed': item.get('pubdate_parsed'),
-                'ingested_at': current_timestamp,
-                'processed': False
-            }
-            
-            formatted_articles.append(formatted_article)
+                
+            new_articles.append(article)
         
-        logger.info(f"Prepared {len(formatted_articles)} new crypto articles for storage ({duplicates_count} duplicates skipped)")
-        return formatted_articles
+        logger.info(f"Prepared {len(new_articles)} new articles for storage ({duplicates_count} duplicates skipped)")
+        
+        # Log which articles are being added (for debugging)
+        if new_articles:
+            logger.info("New articles to be added:")
+            for i, article in enumerate(new_articles[:3], 1):
+                source = article['source_name']
+                title = article['headline'][:50]
+                pub_time = article['published_at'][:19]  # Remove timezone part for cleaner log
+                logger.info(f"  {i}. [{source}] {pub_time} - {title}...")
+            if len(new_articles) > 3:
+                logger.info(f"  ... and {len(new_articles) - 3} more")
+        
+        return new_articles
     
     def cleanup_old_articles(self, new_articles_count: int) -> bool:
         """
-        Remove oldest articles to maintain the maximum limit of articles in database
+        Remove oldest articles to maintain the maximum limit of 100 articles
         
         Args:
             new_articles_count: Number of new articles being added
@@ -340,87 +549,114 @@ class CryptoRSSIngestion:
                 return True
             
             # Get current article count
-            count_result = self.supabase.table(self.crypto_news_table)\
-                .select('*', count='exact')\
+            count_result = self.supabase.table(self.news_table)\
+                .select('id', count='exact')\
                 .execute()
             
             current_count = count_result.count if hasattr(count_result, 'count') else len(count_result.data)
             
             # Calculate how many articles to delete
             total_after_insert = current_count + new_articles_count
-            articles_to_delete = max(0, total_after_insert - self.max_articles)
+            articles_to_delete = max(0, total_after_insert - self.max_articles_in_db)
             
             if articles_to_delete == 0:
-                logger.info(f"No crypto cleanup needed. Current: {current_count}, adding: {new_articles_count}, max: {self.max_articles}")
+                logger.info(f"✅ No cleanup needed. Current: {current_count}, adding: {new_articles_count}, max: {self.max_articles_in_db}")
                 return True
             
-            logger.info(f"Need to delete {articles_to_delete} oldest crypto articles to maintain limit of {self.max_articles}")
+            logger.info(f"🧹 Need to delete {articles_to_delete} oldest articles to maintain limit of {self.max_articles_in_db}")
             
-            # Get the oldest articles to delete (ordered by pubdate_parsed, then by ingested_at)
-            oldest_articles = self.supabase.table(self.crypto_news_table)\
-                .select('id, title')\
-                .order('pubdate_parsed', desc=False)\
-                .order('ingested_at', desc=False)\
+            # Get the oldest articles to delete (ordered by published_at, then by created_at)
+            oldest_articles = self.supabase.table(self.news_table)\
+                .select('id, headline, published_at')\
+                .order('published_at', desc=False)\
+                .order('created_at', desc=False)\
                 .limit(articles_to_delete)\
                 .execute()
             
             if not oldest_articles.data:
-                logger.warning("No crypto articles found to delete")
+                logger.warning("⚠️  No articles found to delete")
                 return True
             
             # Extract IDs to delete
             ids_to_delete = [article['id'] for article in oldest_articles.data]
             
             # Log which articles are being deleted
-            logger.info(f"Deleting {len(ids_to_delete)} oldest crypto articles:")
+            logger.info(f"🗑️  Deleting {len(ids_to_delete)} oldest articles:")
             for article in oldest_articles.data[:3]:  # Log first 3
-                logger.info(f"  - {article['title'][:60]}...")
+                pub_time = article['published_at'][:19] if article['published_at'] else 'Unknown'
+                logger.info(f"    - {pub_time}: {article['headline'][:50]}...")
             if len(oldest_articles.data) > 3:
-                logger.info(f"  ... and {len(oldest_articles.data) - 3} more")
+                logger.info(f"    ... and {len(oldest_articles.data) - 3} more")
             
             # Delete the oldest articles
-            delete_result = self.supabase.table(self.crypto_news_table)\
+            delete_result = self.supabase.table(self.news_table)\
                 .delete()\
                 .in_('id', ids_to_delete)\
                 .execute()
             
-            logger.info(f"Successfully deleted {len(ids_to_delete)} oldest crypto articles")
+            logger.info(f"✅ Successfully deleted {len(ids_to_delete)} oldest articles")
             return True
             
         except Exception as e:
-            logger.error(f"Error during cleanup of old crypto articles: {e}")
+            logger.error(f"❌ Error during cleanup of old articles: {e}")
             return False
     
-    def store_articles_in_supabase(self, formatted_articles: List[Dict]) -> bool:
+    def store_articles_in_supabase(self, articles: List[Dict]) -> bool:
         """
-        Store formatted articles in Supabase
+        Store articles in Supabase
         
         Args:
-            formatted_articles: List of formatted articles
+            articles: List of formatted articles
             
         Returns:
             Boolean indicating success
         """
-        if not formatted_articles:
-            logger.info("No new crypto articles to store")
+        if not articles:
+            logger.info("No new articles to store")
             return True
         
         try:
             # First, cleanup old articles if we're adding new ones
-            cleanup_success = self.cleanup_old_articles(len(formatted_articles))
+            cleanup_success = self.cleanup_old_articles(len(articles))
             if not cleanup_success:
-                logger.warning("Crypto cleanup failed, but continuing with insertion...")
+                logger.warning("⚠️  Cleanup failed, but continuing with insertion...")
             
             # Insert articles
-            result = self.supabase.table(self.crypto_news_table).insert(
-                formatted_articles
-            ).execute()
+            result = self.supabase.table(self.news_table).insert(articles).execute()
             
-            logger.info(f"Successfully stored {len(formatted_articles)} new crypto articles in Supabase")
+            # Debug: Check what was actually inserted
+            if hasattr(result, 'data') and result.data:
+                actual_inserted = len(result.data)
+                logger.info(f"✅ Supabase confirmed {actual_inserted} articles were inserted")
+            else:
+                logger.warning("⚠️  Supabase insert result has no data - checking response structure")
+                logger.info(f"Result object: {type(result)}")
+            
+            # Double-check by querying database count
+            try:
+                count_check = self.supabase.table(self.news_table).select('id', count='exact').execute()
+                current_total = count_check.count if hasattr(count_check, 'count') else len(count_check.data)
+                logger.info(f"📊 Current total articles in database: {current_total} (max: {self.max_articles_in_db})")
+                
+                # Warn if we're over the limit
+                if current_total > self.max_articles_in_db:
+                    logger.warning(f"⚠️  Database has {current_total} articles, which exceeds limit of {self.max_articles_in_db}")
+                    
+            except Exception as count_e:
+                logger.warning(f"Could not verify database count: {count_e}")
+            
+            logger.info(f"✅ Successfully stored {len(articles)} new articles in Supabase")
             return True
             
         except Exception as e:
-            logger.error(f"Error storing crypto articles in Supabase: {e}")
+            logger.error(f"Error storing articles in Supabase: {e}")
+            logger.error(f"Error type: {type(e)}")
+            logger.error(f"Articles that failed to insert: {len(articles)}")
+            
+            # Log first article structure for debugging
+            if articles:
+                logger.error(f"Sample article structure: {list(articles[0].keys())}")
+            
             raise
     
     def get_database_stats(self) -> Dict[str, Any]:
@@ -431,19 +667,17 @@ class CryptoRSSIngestion:
             Dictionary with database statistics
         """
         try:
-            logger.info(f"🔍 Testing connection to table: {self.crypto_news_table}")
-            
             # Get total count
-            count_result = self.supabase.table(self.crypto_news_table)\
-                .select('*', count='exact')\
+            count_result = self.supabase.table(self.news_table)\
+                .select('id', count='exact')\
                 .execute()
             
             total_count = count_result.count if hasattr(count_result, 'count') else len(count_result.data)
             
             # Get latest article
-            latest_result = self.supabase.table(self.crypto_news_table)\
-                .select('unique_id, title, pubdate_parsed')\
-                .order('ingested_at', desc=True)\
+            latest_result = self.supabase.table(self.news_table)\
+                .select('headline, source_name, published_at')\
+                .order('created_at', desc=True)\
                 .limit(1)\
                 .execute()
             
@@ -452,75 +686,79 @@ class CryptoRSSIngestion:
                 'latest_article': latest_result.data[0] if latest_result.data else None
             }
             
-            logger.info(f"✅ Database connection successful. Found {total_count} articles")
             return stats
             
         except Exception as e:
-            logger.error(f"❌ Database connection failed: {e}")
-            logger.error(f"❌ Error type: {type(e)}")
-            # Try a simple test query
-            try:
-                logger.info("🔄 Attempting simple test query...")
-                test_result = self.supabase.table(self.crypto_news_table).select('*').limit(1).execute()
-                logger.info(f"✅ Simple query worked: {len(test_result.data)} rows")
-            except Exception as test_e:
-                logger.error(f"❌ Simple test query also failed: {test_e}")
-            
+            logger.error(f"Error getting database stats: {e}")
             return {'total_articles': 0, 'latest_article': None}
     
     def run_ingestion(self) -> bool:
         """
-        Run the complete crypto RSS news ingestion process
+        Run the complete RSS news ingestion process
         
         Returns:
             Boolean indicating success
         """
         try:
-            logger.info("🪙 Starting crypto RSS news ingestion from multiple sources...")
-            logger.info(f"📊 Maintaining maximum of {self.max_articles} crypto articles in database")
-            logger.info(f"📡 RSS Sources: {', '.join([feed['name'] for feed in self.rss_feeds])}")
+            logger.info("🚀 Starting crypto RSS news ingestion from CoinDesk, Cointelegraph, and The Block...")
+            logger.info(f"📊 Fetching latest {self.max_articles_per_feed} articles from each feed")
+            logger.info(f"🎯 Maintaining maximum of {self.max_articles_in_db} articles in database")
             
             # Get database stats before ingestion
             stats_before = self.get_database_stats()
-            logger.info(f"Database stats before ingestion: {stats_before['total_articles']} total crypto articles")
+            logger.info(f"📊 Database contains {stats_before['total_articles']} articles BEFORE ingestion")
             
-            # Fetch RSS feed
-            rss_items = self.fetch_rss_feed()
+            # Fetch all articles from all feeds
+            all_articles = self.fetch_all_feeds()
             
-            if not rss_items:
-                logger.info("No crypto articles fetched from RSS feeds")
+            if not all_articles:
+                logger.info("No articles fetched from RSS feeds")
                 return True
             
-            # Log the fetched articles
-            logger.info("Fetched crypto articles:")
-            for i, article in enumerate(rss_items[:5], 1):
-                source = article.get('source_feed', 'Unknown')
-                logger.info(f"  {i}. [{source}] {article.get('title', 'No title')[:60]}...")
-            if len(rss_items) > 5:
-                logger.info(f"  ... and {len(rss_items) - 5} more crypto articles")
+            # Log sample of fetched articles
+            logger.info("Sample of fetched articles:")
+            for i, article in enumerate(all_articles[:5], 1):
+                source = article.get('source_name', 'Unknown')
+                title = article.get('headline', 'No title')[:60]
+                logger.info(f"  {i}. [{source}] {title}...")
+            if len(all_articles) > 5:
+                logger.info(f"  ... and {len(all_articles) - 5} more articles")
             
-            # Prepare articles for storage (this will filter out duplicates)
-            formatted_articles = self.prepare_articles_for_storage(rss_items)
+            # Prepare articles for storage (filters out duplicates)
+            new_articles = self.prepare_articles_for_storage(all_articles)
             
-            if not formatted_articles:
-                logger.info("✅ All fetched crypto articles already exist in database - no new articles to add")
+            if not new_articles:
+                logger.info("✅ All fetched articles already exist in database - no new articles to add")
                 return True
             
             # Store in Supabase
-            success = self.store_articles_in_supabase(formatted_articles)
+            success = self.store_articles_in_supabase(new_articles)
             
             if success:
-                # Get database stats after ingestion
+                # Get database stats after ingestion to verify
                 stats_after = self.get_database_stats()
-                logger.info(f"Database stats after ingestion: {stats_after['total_articles']} total crypto articles")
-                logger.info(f"✅ Crypto RSS ingestion completed successfully! Added {len(formatted_articles)} new articles")
+                articles_added = stats_after['total_articles'] - stats_before['total_articles']
+                
+                logger.info(f"📊 Database contains {stats_after['total_articles']} articles AFTER ingestion")
+                logger.info(f"📈 Net change: +{articles_added} articles (Expected: +{len(new_articles)})")
+                
+                if articles_added != len(new_articles):
+                    logger.warning(f"⚠️  MISMATCH: Expected to add {len(new_articles)} but database increased by {articles_added}")
+                    logger.warning("This could indicate:")
+                    logger.warning("  - Duplicate articles slipped through")
+                    logger.warning("  - Database constraints rejecting some inserts")
+                    logger.warning("  - Multiple instances of script running")
+                else:
+                    logger.info("✅ Database count matches expected additions")
+                
+                logger.info(f"✅ Crypto RSS ingestion completed successfully!")
             else:
                 logger.error("❌ Crypto RSS ingestion failed during storage")
             
             return success
             
         except Exception as e:
-            logger.error(f"❌ Fatal error during crypto ingestion: {e}")
+            logger.error(f"❌ Fatal error during ingestion: {e}")
             return False
 
 
@@ -530,16 +768,16 @@ def run_once():
     """
     try:
         # Initialize the ingestion service
-        ingestion_service = CryptoRSSIngestion()
+        ingestion_service = CryptoRSSNewsIngestion()
         
         # Run the ingestion
         success = ingestion_service.run_ingestion()
         
         if success:
-            logger.info("🎉 Crypto ingestion process completed successfully")
+            logger.info("🎉 Ingestion process completed successfully")
             return True
         else:
-            logger.error("💥 Crypto ingestion process failed")
+            logger.error("💥 Ingestion process failed")
             return False
             
     except ValueError as e:
@@ -561,8 +799,8 @@ def main():
     import time
     
     logger.info("=" * 60)
-    logger.info("🪙 Starting Multi-Source Crypto RSS News Ingestion Service")
-    logger.info("📰 Will fetch Cointelegraph + CoinDesk RSS feeds every minute")
+    logger.info("🚀 Starting Crypto RSS News Ingestion Service")
+    logger.info("📰 Will fetch CoinDesk, Cointelegraph & The Block RSS feeds every minute")
     logger.info("=" * 60)
     
     # Run mode from environment variable (default to continuous)
@@ -585,7 +823,7 @@ def main():
         try:
             iteration_start = datetime.now()
             logger.info(f"\n{'=' * 50}")
-            logger.info(f"⏰ Starting crypto ingestion at {iteration_start.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"⏰ Starting ingestion at {iteration_start.strftime('%Y-%m-%d %H:%M:%S')}")
             
             success = run_once()
             
@@ -605,8 +843,9 @@ def main():
             logger.info(f"⏱️  Processing took {processing_time:.2f} seconds")
             
             # Wait for the specified interval
-            sleep_time = max(interval_seconds - processing_time, 1)  # Minimum 1 second sleep
-            logger.info(f"💤 Sleeping for {sleep_time:.2f} seconds until next run...")
+            sleep_time = max(interval_seconds - processing_time, 1)
+            next_run = datetime.now().replace(second=0, microsecond=0) + timedelta(seconds=sleep_time)
+            logger.info(f"💤 Sleeping for {sleep_time:.0f} seconds until next run at {next_run.strftime('%H:%M:%S')}...")
             logger.info(f"{'=' * 50}\n")
             
             time.sleep(sleep_time)
