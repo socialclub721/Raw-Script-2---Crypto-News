@@ -32,9 +32,8 @@ class CryptoRSSNewsIngestion:
         # Initialize Supabase client
         self.supabase: Client = create_client(supabase_url, supabase_key)
         
-        # RSS feed URLs
+        # RSS feed URLs - REMOVED COINDESK
         self.rss_feeds = {
-            'coindesk': 'https://www.coindesk.com/arc/outboundfeeds/rss',
             'cointelegraph': 'https://cointelegraph.com/rss',
             'theblock': 'https://www.theblock.co/rss.xml'
         }
@@ -341,9 +340,7 @@ class CryptoRSSNewsIngestion:
         # Fetch from each feed
         for feed_name, feed_url in self.rss_feeds.items():
             display_name = feed_name.replace('_', ' ').title()
-            if feed_name == 'coindesk':
-                display_name = 'CoinDesk'
-            elif feed_name == 'cointelegraph':
+            if feed_name == 'cointelegraph':
                 display_name = 'Cointelegraph'
             elif feed_name == 'theblock':
                 display_name = 'The Block'
@@ -576,9 +573,9 @@ class CryptoRSSNewsIngestion:
             
             total_count = count_result.count if hasattr(count_result, 'count') else len(count_result.data)
             
-            # Get count by source
+            # Get count by source - UPDATED TO ONLY CHECK FOR COINTELEGRAPH AND THE BLOCK
             source_counts = {}
-            for source in ['CoinDesk', 'Cointelegraph', 'The Block']:
+            for source in ['Cointelegraph', 'The Block']:
                 source_result = self.supabase.table(self.news_table)\
                     .select('id', count='exact')\
                     .eq('source_name', source)\
@@ -677,8 +674,8 @@ def main():
     import time
     
     logger.info("=" * 60)
-    logger.info("🚀 Crypto RSS News Ingestion Service (No Duplicates)")
-    logger.info("📰 Sources: CoinDesk, Cointelegraph & The Block")
+    logger.info("🚀 Crypto RSS News Ingestion Service")
+    logger.info("📰 Sources: Cointelegraph & The Block")
     logger.info("=" * 60)
     
     run_mode = os.getenv('RUN_MODE', 'continuous').lower()
